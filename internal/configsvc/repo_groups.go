@@ -119,18 +119,23 @@ func (r *Repo) RemoveDeviceFromGroup(uuid string, groupID uint) error {
 
 // ── Group template assignments ──────────────────────────────
 
-func (r *Repo) AssignTemplateToGroup(groupID, templateID uint, enabled bool) error {
-	var a models.GroupTemplateAssignment
-	tx := r.db.Where("group_id = ? AND template_id = ?", groupID, templateID).First(&a)
-	if tx.Error != nil {
-		if errors.Is(tx.Error, gorm.ErrRecordNotFound) {
-			a = models.GroupTemplateAssignment{GroupID: groupID, TemplateID: templateID, Enabled: enabled}
-			return r.db.Create(&a).Error
+func (r *Repo) AssignTemplateToGroup(groupID, tplID uint, order int, enabled bool) error {
+	var ex models.GroupTemplateAssignment
+	tx := r.db.Where("group_id = ? AND template_id = ?", groupID, tplID).First(&ex)
+	if tx.Error == nil {
+		ex.Enabled = enabled
+		if order != 0 {
+			ex.Order = order
 		}
-		return tx.Error
+		return r.db.Save(&ex).Error
 	}
-	a.Enabled = enabled
-	return r.db.Save(&a).Error
+	as := models.GroupTemplateAssignment{
+		GroupID:    groupID,
+		TemplateID: tplID,
+		Enabled:    enabled,
+		Order:      order,
+	}
+	return r.db.Create(&as).Error
 }
 
 func (r *Repo) ListGroupAssignments(groupID uint) ([]models.GroupTemplateAssignment, error) {

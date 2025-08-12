@@ -117,9 +117,9 @@ func (r *Repo) TemplatesByIDs(ids []uint) ([]models.Template, error) {
 }
 
 func (r *Repo) ListRequiredTemplates() ([]models.Template, error) {
-	var t []models.Template
-	err := r.db.Where("required = ?", true).Order("id ASC").Find(&t).Error
-	return t, err
+	var out []models.Template
+	err := r.db.Where("required = ?", true).Order("id ASC").Find(&out).Error
+	return out, err
 }
 
 // group templates
@@ -138,18 +138,34 @@ func (r *Repo) ListGroupTemplates(groupIDs []uint) ([]models.GroupTemplateAssign
 // device blocks
 func (r *Repo) ListDeviceTemplateBlocks(uuid string) (map[uint]struct{}, error) {
 	var rows []models.DeviceTemplateBlock
-	err := r.db.Where("device_uuid = ?", uuid).Find(&rows).Error
-	if err != nil {
+	if err := r.db.Where("device_uuid = ?", uuid).Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	m := make(map[uint]struct{}, len(rows))
+	res := make(map[uint]struct{}, len(rows))
 	for _, b := range rows {
-		m[b.TemplateID] = struct{}{}
+		res[b.TemplateID] = struct{}{}
 	}
-	return m, nil
+	return res, nil
 }
 
-// helpers
+func (r *Repo) BlockTemplateForDevice(uuid string, tplID uint) error {
+	var ex models.DeviceTemplateBlock
+	tx := r.db.Where("device_uuid = ? AND template_id = ?", uuid, tplID).First(&ex)
+	if tx.Error == nil {
+		return nil
+	}
+	return r.db.Create(&models.DeviceTemplateBlock{
+		DeviceUUID: uuid,
+		TemplateID: tplID,
+	}).Error
+}
+
+func (r *Repo) UnblockTemplateForDevice(uuid string, tplID uint) error {
+	return r.db.Where("device_uuid = ? AND template_id = ?", uuid, tplID).
+		Delete(&models.DeviceTemplateBlock{}).Error
+}
+
+// HELPERS
 func (r *Repo) GetTemplatesByIDs(ids []uint) (map[uint]models.Template, error) {
 	if len(ids) == 0 {
 		return map[uint]models.Template{}, nil

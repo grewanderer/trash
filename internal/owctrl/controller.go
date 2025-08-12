@@ -92,12 +92,13 @@ type Builder struct {
 	repo    VarsProvider
 	ipam    IPAMProvider
 	tpl     TemplateRenderer
-	gvars   GlobalVarsProvider
 	tplrepo TemplateRepository
+	gvars   GlobalVarsProvider
 }
 
 type TemplateRepository interface {
 	ListRequiredTemplates() ([]models.Template, error)
+	ListDefaultTemplates() ([]models.Template, error)
 	ListGroupTemplates(groupIDs []uint) ([]models.GroupTemplateAssignment, error)
 	ListAssignments(uuid string) ([]models.DeviceTemplateAssignment, error)
 	ListDeviceTemplateBlocks(uuid string) (map[uint]struct{}, error)
@@ -243,14 +244,12 @@ func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
 			merged[k] = v
 		}
 	}
-
 	// 1) group
-	groupIDs, _ := b.repo.GetGroupIDs(uuid)
-	gvars, _ := b.repo.GetGroupVars(groupIDs)
+	gids, _ := b.repo.GetGroupIDs(uuid)
+	gvars, _ := b.repo.GetGroupVars(gids)
 	for k, v := range gvars {
 		merged[k] = v
 	}
-
 	// 2) device
 	dvars, _ := b.repo.GetDeviceVars(uuid)
 	for k, v := range dvars {
@@ -315,6 +314,8 @@ func (b *Builder) BuildConfig(d DeviceFields) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// предопределённые (в OpenWISP они всегда доступны)
 	vars["id"] = d.UUID
 	vars["key"] = d.Key
 	vars["name"] = d.Name
@@ -330,15 +331,13 @@ func (b *Builder) BuildConfig(d DeviceFields) (map[string]string, error) {
 		return nil, fmt.Errorf("collect templates: %w", err)
 	}
 
-	// отрисовываем по порядку, позже перекрывает ранее созданный файл по тому же path
 	files := map[string]string{}
 	for _, t := range tpls {
-		rendered, err := b.tpl.RenderOne(t, vars) // добавь метод; для Type="go" → Go-template; Type="netjson" → см. ниже
+		rendered, err := b.tpl.RenderOne(t, vars)
 		if err != nil {
 			return nil, fmt.Errorf("template %d (%s): %w", t.ID, t.Name, err)
 		}
-		// у шаблона один path; если «мультифайл» — верни map[path]body
-		files[t.Path] = rendered
+		files[t.Path] = rendered // более поздний перекрывает ранний по одному path
 	}
 	return files, nil
 }
@@ -743,6 +742,6 @@ func normalizeStatus(s string) string {
 	case "deactivating":
 		return "deactivating"
 	default:
-		return "pending" // changed, modified, queued и пр.
+		return "pending"
 	}
 }

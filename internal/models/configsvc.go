@@ -4,13 +4,13 @@ import "gorm.io/gorm"
 
 type Template struct {
 	gorm.Model
-	Name string `gorm:"uniqueIndex:idx_tpl_name"`
-	Path string
-	Body string
-	Type string `gorm:"default:'go'"` // go | netjson
-	// NEW:
-	Required bool `gorm:"default:false"` // как в OpenWISP: обязательный шаблон
-	// На будущее: Tags []string (json) — для авто-назначения по тегам
+	Name     string `gorm:"uniqueIndex:idx_tpl_name"`
+	Path     string
+	Body     string
+	Type     string `gorm:"default:'go'"` // "go" | "netjson"
+	Required bool   `gorm:"default:false"`
+	Default  bool   `gorm:"default:false"`
+	// При необходимости: Backend, Tags JSON и т.п.
 }
 
 type DeviceVariable struct {
@@ -21,17 +21,17 @@ type DeviceVariable struct {
 }
 
 type DeviceTemplateAssignment struct {
-    gorm.Model
-    DeviceUUID string `gorm:"index;size:36"`
-    TemplateID uint   `gorm:"index"`
-    Enabled    bool   `gorm:"default:true"`
-    Order      int    `gorm:"default:100;index"`
+	gorm.Model
+	DeviceUUID string `gorm:"index;size:36"`
+	TemplateID uint   `gorm:"index"`
+	Enabled    bool   `gorm:"default:true"`
+	Order      int    `gorm:"default:100;index"`
 }
 
 type DeviceTemplateBlock struct {
-    gorm.Model
-    DeviceUUID string `gorm:"index;size:36"`
-    TemplateID uint   `gorm:"index"`
+	gorm.Model
+	DeviceUUID string `gorm:"index;size:36"`
+	TemplateID uint   `gorm:"index"`
 }
 
 type Group struct {
@@ -54,9 +54,9 @@ type GroupVariable struct {
 }
 
 type GroupTemplateAssignment struct {
-    gorm.Model
-    GroupID    uint   `gorm:"index"`
-    TemplateID uint   `gorm:"index"`
-    Enabled    bool   `gorm:"default:true"`
-    Order      int    `gorm:"default:100;index"`
+	gorm.Model
+	GroupID    uint `gorm:"index"`
+	TemplateID uint `gorm:"index"`
+	Enabled    bool `gorm:"default:true"`
+	Order      int  `gorm:"default:100;index"`
 }

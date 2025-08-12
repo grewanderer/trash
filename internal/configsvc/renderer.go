@@ -1,37 +1,38 @@
-// internal/configsvc/renderer.go
 package configsvc
 
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"os/exec"
 	"text/template"
 	"wisp/internal/models"
 )
 
-// Убедитесь, что этот тип уже есть у вас. Если нет — добавьте простой каркас:
-type Renderer struct {
-	// здесь могут быть зависимости (repo, функции и т.п.)
-}
+type Renderer struct{}
 
-// NewRenderer — конструктор по месту инициализации.
 func NewRenderer() *Renderer { return &Renderer{} }
 
-// RenderAll — если в проекте уже реализован, оставьте как есть.
-// В противном случае пока можно вернуть ошибку, если нигде не используется.
-// Лучше, конечно, чтобы RenderAll пользовался вашим репозиторием назначений.
 func (r *Renderer) RenderAll(_ string, _ map[string]string) (map[string]string, error) {
-	return nil, fmt.Errorf("RenderAll is not implemented in this renderer; use Builder.collectTemplates + RenderOne")
+	return nil, fmt.Errorf("RenderAll not used; builder calls RenderOne sequentially")
 }
 
-// RenderOne — реализация, которой не хватало.
-// Поддерживаем типы шаблонов: "go" (по умолчанию).
 func (r *Renderer) RenderOne(t models.Template, vars map[string]string) (string, error) {
 	switch t.Type {
 	case "", "go":
 		return renderGoTemplate(t.Body, map[string]any{"vars": vars})
-	// case "netjson":
-	//     // сюда позже можно подключить адаптер netjsonconfig
-	//     return "", fmt.Errorf("netjson templates are not supported yet")
+	case "netjson":
+		// 1) подставим vars в JSON-шаблон как в go-template (если нужно)
+		jsonWithVars, err := renderGoTemplate(t.Body, map[string]any{"vars": vars})
+		if err != nil {
+			return "", fmt.Errorf("pre-template: %w", err)
+		}
+		// 2) прогон через netjsonconfig
+		uci, err := renderViaNetjsonconfig(jsonWithVars)
+		if err != nil {
+			return "", err
+		}
+		return uci, nil
 	default:
 		return "", fmt.Errorf("unknown template type: %s", t.Type)
 	}
@@ -41,7 +42,6 @@ func renderGoTemplate(body string, data any) (string, error) {
 	tpl, err := template.New("tpl").
 		Option("missingkey=error").
 		Funcs(template.FuncMap{
-			// удобные функции, если нужно:
 			"get": func(m map[string]string, k string) string { return m[k] },
 			"has": func(m map[string]string, k string) bool { _, ok := m[k]; return ok },
 		}).
@@ -54,4 +54,21 @@ func renderGoTemplate(body string, data any) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+func renderViaNetjsonconfig(netjson string) (string, error) {
+	bin := os.Getenv("NETJSONCONFIG_BIN")
+	if bin == "" {
+		bin = "netjsonconfig"
+	}
+
+	cmd := exec.Command(bin, "-b", "openwrt", "-o", "uci")
+	cmd.Stdin = bytes.NewBufferString(netjson)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("netjsonconfig error: %v: %s", err, stderr.String())
+	}
+	return out.String(), nil
 }

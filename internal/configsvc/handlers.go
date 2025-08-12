@@ -33,6 +33,126 @@ func (h *HTTP) RegisterRoutes(r *mux.Router) {
 	api.HandleFunc("/devices/{uuid}/templates/{id}", h.assignTemplate).Methods(http.MethodPost)
 	api.HandleFunc("/devices/{uuid}/templates", h.listAssignments).Methods(http.MethodGet)
 	api.HandleFunc("/devices/{uuid}/templates/order", h.reorderTemplates).Methods(http.MethodPut, http.MethodPost)
+
+	api.HandleFunc("/groups/{id}/templates", h.assignTemplateToGroup).Methods(http.MethodPost)
+
+	// DEVICE BLOCKS
+	api.HandleFunc("/devices/{uuid}/templates/{id}/block", h.blockTpl).Methods(http.MethodDelete, http.MethodPost)
+	api.HandleFunc("/devices/{uuid}/templates/{id}/unblock", h.unblockTpl).Methods(http.MethodDelete, http.MethodPost)
+
+	// RESOLVED TEMPLATE LIST (по порядку: required→default→group→device)
+	api.HandleFunc("/devices/{uuid}/templates/resolved", h.resolvedTemplates).Methods(http.MethodGet)
+}
+
+func (h *HTTP) assignTemplateToGroup(w http.ResponseWriter, r *http.Request) {
+	gidU, _ := strconv.ParseUint(mux.Vars(r)["id"], 10, 64)
+	var in struct {
+		TemplateID uint  `json:"template_id"`
+		Order      int   `json:"order"`
+		Enabled    *bool `json:"enabled"`
+	}
+	enabled := true
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.Enabled != nil {
+		enabled = *in.Enabled
+	}
+	if in.TemplateID == 0 {
+		http.Error(w, "template_id required", 400)
+		return
+	}
+	if err := h.repo.AssignTemplateToGroup(uint(gidU), in.TemplateID, in.Order, enabled); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *HTTP) blockTpl(w http.ResponseWriter, r *http.Request) {
+	uuid := mux.Vars(r)["uuid"]
+	idU, _ := strconv.ParseUint(mux.Vars(r)["id"], 10, 64)
+	if err := h.repo.BlockTemplateForDevice(uuid, uint(idU)); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *HTTP) unblockTpl(w http.ResponseWriter, r *http.Request) {
+	uuid := mux.Vars(r)["uuid"]
+	idU, _ := strconv.ParseUint(mux.Vars(r)["id"], 10, 64)
+	if err := h.repo.UnblockTemplateForDevice(uuid, uint(idU)); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// resolved list на чтение (без рендера), полезно для UI
+func (h *HTTP) resolvedTemplates(w http.ResponseWriter, r *http.Request) {
+	uuid := mux.Vars(r)["uuid"]
+
+	// required
+	req, _ := h.repo.ListRequiredTemplates()
+
+	// default
+	def, _ := h.repo.ListDefaultTemplates()
+
+	// group (с учётом блоков)
+	gids, _ := h.repo.GetGroupIDs(uuid) // этот метод у тебя есть
+	gas, _ := h.repo.ListGroupTemplates(gids)
+	blocks, _ := h.repo.ListDeviceTemplateBlocks(uuid)
+	gTplIDs := make([]uint, 0, len(gas))
+	for _, a := range gas {
+		if _, blocked := blocks[a.TemplateID]; blocked {
+			continue
+		}
+		gTplIDs = append(gTplIDs, a.TemplateID)
+	}
+
+	// device
+	das, _ := h.repo.ListAssignments(uuid)
+
+	// собрать карты
+	ids := make([]uint, 0, len(req)+len(def)+len(gTplIDs)+len(das))
+	for _, t := range req {
+		ids = append(ids, t.ID)
+	}
+	for _, t := range def {
+		ids = append(ids, t.ID)
+	}
+	ids = append(ids, gTplIDs...)
+	for _, a := range das {
+		ids = append(ids, a.TemplateID)
+	}
+	byID, _ := h.repo.GetTemplatesByIDs(ids)
+
+	type item struct {
+		Source   string          `json:"source"` // required|default|group|device
+		Order    int             `json:"order"`
+		Template models.Template `json:"template"`
+	}
+	out := make([]item, 0, len(ids))
+
+	for _, t := range req {
+		out = append(out, item{Source: "required", Order: 0, Template: t})
+	}
+	for _, t := range def {
+		out = append(out, item{Source: "default", Order: 0, Template: t})
+	}
+	for _, a := range gas {
+		if _, blocked := blocks[a.TemplateID]; blocked {
+			continue
+		}
+		if t, ok := byID[a.TemplateID]; ok {
+			out = append(out, item{Source: "group", Order: a.Order, Template: t})
+		}
+	}
+	for _, a := range das {
+		if t, ok := byID[a.TemplateID]; ok {
+			out = append(out, item{Source: "device", Order: a.Order, Template: t})
+		}
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (h *HTTP) createTemplate(w http.ResponseWriter, r *http.Request) {
@@ -223,4 +343,29 @@ func (h *HTTP) listAssignments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(as)
+}
+
+// ListDefaultTemplates — вернуть шаблоны, помеченные как Default (применяются ко всем устройствам, если не переопределено).
+func (r *Repo) ListDefaultTemplates() ([]models.Template, error) {
+	var out []models.Template
+	err := r.db.
+		Where("`default` = ?", true).
+		Order("id ASC").
+		Find(&out).Error
+	return out, err
+}
+
+// GetGroupIDs — ID всех групп, в которых состоит устройство.
+func (r *Repo) GetGroupIDs(deviceUUID string) ([]uint, error) {
+	var rows []models.DeviceGroup
+	if err := r.db.
+		Where("device_uuid = ?", deviceUUID).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]uint, 0, len(rows))
+	for _, dg := range rows {
+		ids = append(ids, dg.GroupID)
+	}
+	return ids, nil
 }

@@ -79,6 +79,8 @@ func (a *App) Initialize(cfg *config.Config) {
 			&models.DeviceGroup{},
 			&models.GroupVariable{},
 			&models.GroupTemplateAssignment{},
+			&models.DeviceTemplateBlock{},
+			&models.DeviceStatusHistory{},
 
 			// ipam (prefixes & IPs)
 			&models.Prefix{},
