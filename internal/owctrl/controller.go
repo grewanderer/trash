@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,10 @@ type DeviceFields struct {
 	LastError string
 	LastSHA   string
 	UpdatedAt time.Time
+}
+
+type GlobalVarsProvider interface {
+	GlobalVars() map[string]string
 }
 
 // Store — контракт хранилища устройств.
@@ -88,9 +93,68 @@ func (a *TemplateBuildAdapter) BuildConfig(d DeviceFields) (map[string]string, e
 
 // Builder имеет ссылки на repo и ipam
 type Builder struct {
-	repo VarsProvider
-	ipam IPAMProvider
-	tpl  TemplateRenderer
+	repo  VarsProvider
+	ipam  IPAMProvider
+	tpl   TemplateRenderer
+	gvars GlobalVarsProvider // новый
+}
+
+func (c *Controller) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
+	c.setOWHeader(w)
+	id := mux.Vars(r)["uuid"]
+	key := r.URL.Query().Get("key")
+
+	dev, ok := c.store.FindByUUID(id)
+	if !ok {
+		models.WriteProblem(w, http.StatusNotFound, "Not found", "device not found", map[string]string{"uuid": id})
+		return
+	}
+	if key == "" || key != dev.Key {
+		models.WriteProblem(w, http.StatusForbidden, "Forbidden", "invalid key", nil)
+		return
+	}
+
+	files, err := c.buildFiles(dev)
+	if err != nil {
+		models.WriteProblem(w, http.StatusInternalServerError, "Build failed", err.Error(), nil)
+		return
+	}
+	tgz := mustTarGz(files)
+	sum := sha256.Sum256(tgz)
+	shaHex := hex.EncodeToString(sum[:])
+
+	// красиво отсортируем пути
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	type FileInfo struct {
+		Path    string `json:"path"`
+		Size    int    `json:"size"`
+		Preview string `json:"preview"`
+	}
+	out := struct {
+		SHA256 string     `json:"sha256"`
+		Files  []FileInfo `json:"files"`
+	}{SHA256: shaHex}
+
+	for _, p := range paths {
+		body := files[p]
+		prev := body
+		if len(prev) > 300 {
+			prev = prev[:300] + "...(truncated)"
+		}
+		out.Files = append(out.Files, FileInfo{
+			Path:    p,
+			Size:    len(body),
+			Preview: prev,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (m *memStore) UpdateStatusDetail(id, st, sha, errMsg string, _ map[string]any) error {
@@ -114,17 +178,21 @@ func (m *memStore) UpdateStatusDetail(id, st, sha, errMsg string, _ map[string]a
 }
 
 func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
-	// 1) group vars
+	// 0) global
+	merged := map[string]string{}
+	if b.gvars != nil {
+		for k, v := range b.gvars.GlobalVars() {
+			merged[k] = v
+		}
+	}
+	// 1) group
 	groupIDs, _ := b.repo.GetGroupIDs(uuid)
 	gvars, _ := b.repo.GetGroupVars(groupIDs)
-
-	// 2) device vars
-	dvars, _ := b.repo.GetDeviceVars(uuid)
-
-	merged := map[string]string{}
 	for k, v := range gvars {
 		merged[k] = v
 	}
+	// 2) device
+	dvars, _ := b.repo.GetDeviceVars(uuid)
 	for k, v := range dvars {
 		merged[k] = v
 	}
@@ -368,7 +436,9 @@ func (c *Controller) handleChecksum(w http.ResponseWriter, r *http.Request) {
 
 	files, err := c.buildFiles(dev)
 	if err != nil {
-		models.WriteProblem(w, http.StatusInternalServerError, "Build failed", "config build error", nil)
+		models.WriteProblem(w, http.StatusUnprocessableEntity, "Build failed", err.Error(), map[string]string{
+			"uuid": dev.UUID,
+		})
 		return
 	}
 	tgz := mustTarGz(files)
@@ -397,7 +467,9 @@ func (c *Controller) handleDownloadConfig(w http.ResponseWriter, r *http.Request
 
 	files, err := c.buildFiles(dev)
 	if err != nil {
-		models.WriteProblem(w, http.StatusInternalServerError, "Build failed", "config build error", nil)
+		models.WriteProblem(w, http.StatusUnprocessableEntity, "Build failed", err.Error(), map[string]string{
+			"uuid": dev.UUID,
+		})
 		return
 	}
 	tgz := mustTarGz(files)
@@ -560,6 +632,7 @@ func RegisterRoutes(root *mux.Router, sharedSecret string) {
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
+	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
 }
 
 // RegisterRoutesWithStore — с внешним хранилищем (БД).
@@ -570,6 +643,7 @@ func RegisterRoutesWithStore(root *mux.Router, sharedSecret string, store Store)
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
+	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
 }
 
 // RegisterRoutesWithStoreAndBuilder — с внешним хранилищем и сборщиком конфигов.
@@ -580,4 +654,5 @@ func RegisterRoutesWithStoreAndBuilder(root *mux.Router, sharedSecret string, st
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
+	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
 }

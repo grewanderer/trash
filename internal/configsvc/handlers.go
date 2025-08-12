@@ -174,7 +174,7 @@ func (h *HTTP) reorderTemplates(w http.ResponseWriter, r *http.Request) {
 		} `json:"items"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "invalid json", 400)
+		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	items := make([]ReorderItem, 0, len(in.Items))
@@ -182,7 +182,7 @@ func (h *HTTP) reorderTemplates(w http.ResponseWriter, r *http.Request) {
 		items = append(items, ReorderItem{ID: it.ID, Order: it.Order})
 	}
 	if err := h.repo.ReorderDeviceTemplates(uuid, items); err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
