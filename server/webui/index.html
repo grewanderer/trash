@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>OpenWISP-Go · Dev UI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+<header>
+  <h1>OpenWISP-Go · Dev UI</h1>
+  <div class="bar">
+    <label>Base URL
+      <input id="baseUrl" type="text" />
+    </label>
+    <button id="btnHealth">Health</button>
+    <span id="healthBadge" class="badge">—</span>
+    <span class="muted">ETag:</span>
+    <code id="etagVal">—</code>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>1) Controller · Register / Checksum / Download / Debug</h2>
+    <div class="grid3">
+      <div>
+        <h3>Register device</h3>
+        <form id="formRegister">
+          <label>Shared secret <input name="secret" required/></label>
+          <label>Name <input name="name" value="test-router" required/></label>
+          <label>Backend <input name="backend" value="openwrt" required/></label>
+          <label>MAC <input name="mac_address" value="aa:bb:cc:dd:ee:ff" required/></label>
+          <button type="submit">Register</button>
+        </form>
+        <div class="kv">
+          <div>UUID: <code id="devUuid">—</code></div>
+          <div>Key: <code id="devKey">—</code></div>
+          <div>Status: <code id="devStatus">—</code></div>
+        </div>
+      </div>
+
+      <div>
+        <h3>Checksum / Download</h3>
+        <div class="row">
+          <button id="btnChecksum">Get checksum</button>
+          <code id="checksumVal">—</code>
+        </div>
+        <div class="row">
+          <button id="btnDownload">Download config (tar.gz)</button>
+          <span id="dlHint"></span>
+        </div>
+        <div class="row">
+          <button id="btnDebugCfg">Show debug-config (JSON)</button>
+        </div>
+      </div>
+
+      <div>
+        <h3>Vars catalog</h3>
+        <div class="row">
+          <button id="btnCatalog">Load catalog</button>
+        </div>
+        <pre id="catalogOut" class="mono small"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2) Templates</h2>
+    <div class="grid3">
+      <div>
+        <h3>Create template</h3>
+        <form id="formTemplate">
+          <label>Name <input name="name" placeholder="system-hostname" required/></label>
+          <label>Path <input name="path" placeholder="etc/config/system" required/></label>
+          <label>Body <textarea name="body" rows="10" placeholder="template body" required></textarea></label>
+          <div class="row">
+            <button type="button" id="btnSampleSystem">Sample: system</button>
+            <button type="button" id="btnSampleNetwork">Sample: network</button>
+            <button type="button" id="btnSampleWireless">Sample: wireless</button>
+          </div>
+          <button type="submit">Create</button>
+        </form>
+        <div>Template ID: <code id="lastTplId">—</code></div>
+      </div>
+
+      <div>
+        <h3>Templates list</h3>
+        <div class="row">
+          <button id="btnListTpl">Refresh list</button>
+        </div>
+        <table id="tplTable">
+          <thead><tr><th>ID</th><th>Name</th><th>Path</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div>
+        <h3>Assign to device</h3>
+        <label>Template IDs (comma-separated)
+          <input id="assignTplIds" placeholder="1,2"/>
+        </label>
+        <button id="btnAssignTpl">Assign</button>
+        <pre id="tplList" class="mono small"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3) Vars · Device & Group</h2>
+    <div class="grid3">
+      <div>
+        <h3>Device vars (bulk JSON)</h3>
+        <textarea id="varsJSON" rows="12" placeholder='{
+  "wan_proto":"static",
+  "hostname":"branch-ap-01",
+  "timezone":"Europe/Rome",
+  "ipv4_address":"10.100.0.2",
+  "ipv4_netmask":"255.255.255.0",
+  "ipv4_gateway":"10.100.0.1",
+  "dns_servers":"1.1.1.1,8.8.8.8",
+  "ssh_authorized_keys":"ssh-ed25519 AAAA... user@host"
+}'></textarea>
+        <div class="row">
+          <button id="btnUpsertVars">Upsert vars</button>
+          <button id="btnShowVars">Show vars</button>
+        </div>
+        <pre id="varsOut" class="mono small"></pre>
+      </div>
+
+      <div>
+        <h3>Create / Join group</h3>
+        <form id="formGroup">
+          <label>Name <input name="name" value="branch-a" required/></label>
+          <button type="submit">Create (or reuse)</button>
+        </form>
+        <div>Group ID: <code id="groupId">—</code></div>
+        <div class="row">
+          <button id="btnJoinGroup">Add device to group</button>
+          <button id="btnLeaveGroup">Remove from group</button>
+        </div>
+        <div class="row">
+          <button id="btnListGroups">List device groups</button>
+        </div>
+        <pre id="groupsOut" class="mono small"></pre>
+      </div>
+
+      <div>
+        <h3>Group vars (bulk JSON)</h3>
+        <textarea id="gvarsJSON" rows="10" placeholder='{
+  "timezone":"Europe/Rome",
+  "wifi_country":"IT",
+  "wifi_band":"5g"
+}'></textarea>
+        <button id="btnUpsertGVars">Upsert group vars</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>4) IPAM · Prefixes & Device IP</h2>
+    <div class="grid3">
+      <div>
+        <h3>Root prefix</h3>
+        <label>CIDR <input id="rootCIDR" value="10.100.0.0/16"/></label>
+        <button id="btnCreateRoot">Create root</button>
+        <div>Root ID: <code id="rootPid">—</code></div>
+      </div>
+      <div>
+        <h3>Assign /24 to group</h3>
+        <label>new_prefix_len <input id="newPrefixLen" value="24"/></label>
+        <button id="btnAssignGroupPrefix">Assign to group</button>
+        <div>Group Prefix ID: <code id="groupPid">—</code></div>
+      </div>
+      <div>
+        <h3>Assign IP to device</h3>
+        <button id="btnAssignIP">Assign IP</button>
+        <pre id="ipList" class="mono small"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5) Debug · Generated files</h2>
+    <pre id="debugCfg" class="mono tall"></pre>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log" class="mono tall"></pre>
+  </section>
+</main>
+
+<footer>
+  <small>Dev UI, single-binary, no deps. Uses same-origin API.</small>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

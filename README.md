@@ -1,0 +1,1 @@
+CONFIG_FILE=./config/config.example.yaml go run main.go

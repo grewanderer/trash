@@ -1,0 +1,43 @@
+# OpenWISP-Go — пример конфигурации
+
+server:
+  address: "0.0.0.0"   # где слушать HTTP
+  http_port: "8080"    # порт HTTP
+
+logs:
+  level: info      # trace|debug|info|warning|error|fatal
+  format: text     # text|json
+  file: ""         # если указать путь/префикс, логи пойдут и в файл
+
+database:
+  driver: "mysql"
+  dsn:  "root@tcp(127.0.0.1:3306)/owgo?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&loc=Local"
+  
+
+openwisp:
+  # Секрет для регистрации агента openwisp-config (должен совпадать на устройстве).
+  # ОБЯЗАТЕЛЬНО замените!
+  shared_secret: "my_shared_secret"
+
+controller:
+  # место, где позже будут лежать шаблоны конфигураций (если выберем файловый бэкенд)
+  templates_dir: "./templates"
+  allow_insecure_http: true  # оставить true для локальной разработки без TLS
+
+ssh:
+  enabled: false
+  user: "root"
+  private_key_path: "/etc/openwisp-go/ssh/id_ed25519"
+
+ipam:
+  # примеры подсетей для автопула, когда будем подключать IPAM
+  default_ipv4_prefix: "10.100.0.0/16"
+  default_ipv6_prefix: "fd00:100::/48"
+
+pki:
+  enabled: false
+  ca_dir: "/etc/openwisp-go/pki"
+
+radius:
+  enabled: false
+  dsn: "postgres://user:pass@localhost/radius"
