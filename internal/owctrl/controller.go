@@ -79,10 +79,6 @@ type IPAMProvider interface {
 	GetPrefixByID(id uint) (models.Prefix, bool, error)
 }
 
-type TemplateRenderer interface {
-	RenderAll(deviceUUID string, vars map[string]string) (map[string]string, error)
-}
-
 // TemplateBuildAdapter — обёртка, которая делает наш Builder совместимым с ConfigBuilder.
 type TemplateBuildAdapter struct{ B *Builder }
 
@@ -93,10 +89,75 @@ func (a *TemplateBuildAdapter) BuildConfig(d DeviceFields) (map[string]string, e
 
 // Builder имеет ссылки на repo и ipam
 type Builder struct {
-	repo  VarsProvider
-	ipam  IPAMProvider
-	tpl   TemplateRenderer
-	gvars GlobalVarsProvider // новый
+	repo    VarsProvider
+	ipam    IPAMProvider
+	tpl     TemplateRenderer
+	gvars   GlobalVarsProvider
+	tplrepo TemplateRepository
+}
+
+type TemplateRepository interface {
+	ListRequiredTemplates() ([]models.Template, error)
+	ListGroupTemplates(groupIDs []uint) ([]models.GroupTemplateAssignment, error)
+	ListAssignments(uuid string) ([]models.DeviceTemplateAssignment, error)
+	ListDeviceTemplateBlocks(uuid string) (map[uint]struct{}, error)
+	GetTemplatesByIDs(ids []uint) (map[uint]models.Template, error)
+}
+
+func NewBuilder(repo VarsProvider, ip IPAMProvider, tpl TemplateRenderer, g GlobalVarsProvider) *Builder {
+	return &Builder{repo: repo, ipam: ip, tpl: tpl, gvars: g}
+}
+
+func (b *Builder) collectTemplates(uuid string) ([]models.Template, error) {
+	// 1) required
+	req, _ := b.tplrepo.ListRequiredTemplates()
+	// 2) group (с учётом блок-листа)
+	gids, _ := b.repo.GetGroupIDs(uuid)
+	gas, _ := b.tplrepo.ListGroupTemplates(gids)
+	blocks, _ := b.tplrepo.ListDeviceTemplateBlocks(uuid)
+	groupIDs := make([]uint, 0, len(gas))
+	for _, a := range gas {
+		if _, blocked := blocks[a.TemplateID]; blocked {
+			continue
+		}
+		groupIDs = append(groupIDs, a.TemplateID)
+	}
+	// 3) device
+	das, _ := b.tplrepo.ListAssignments(uuid)
+	// собираем полный список ID
+	ids := make([]uint, 0, len(req)+len(groupIDs)+len(das))
+	for _, t := range req {
+		ids = append(ids, t.ID)
+	}
+	ids = append(ids, groupIDs...)
+	for _, a := range das {
+		ids = append(ids, a.TemplateID)
+	}
+	// загружаем карты ID->Template
+	byID, _ := b.tplrepo.GetTemplatesByIDs(ids)
+	// финальная упорядоченная последовательность:
+	out := make([]models.Template, 0, len(ids))
+
+	// required: как есть, по id ASC (мы уже вытянули в порядке id)
+	out = append(out, req...)
+
+	// group: сортировка уже учтена в запросе по order asc, id asc
+	for _, a := range gas {
+		if _, blocked := blocks[a.TemplateID]; blocked {
+			continue
+		}
+		if t, ok := byID[a.TemplateID]; ok {
+			out = append(out, t)
+		}
+	}
+
+	// device: сортировка по order asc, id asc
+	for _, a := range das {
+		if t, ok := byID[a.TemplateID]; ok {
+			out = append(out, t)
+		}
+	}
+	return out, nil
 }
 
 func (c *Controller) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
@@ -116,28 +177,28 @@ func (c *Controller) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 
 	files, err := c.buildFiles(dev)
 	if err != nil {
-		models.WriteProblem(w, http.StatusInternalServerError, "Build failed", err.Error(), nil)
+		models.WriteProblem(w, http.StatusUnprocessableEntity, "Build failed", err.Error(), nil)
 		return
 	}
+
 	tgz := mustTarGz(files)
 	sum := sha256.Sum256(tgz)
 	shaHex := hex.EncodeToString(sum[:])
 
-	// красиво отсортируем пути
 	paths := make([]string, 0, len(files))
 	for p := range files {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
 
-	type FileInfo struct {
+	type fileInfo struct {
 		Path    string `json:"path"`
 		Size    int    `json:"size"`
 		Preview string `json:"preview"`
 	}
 	out := struct {
 		SHA256 string     `json:"sha256"`
-		Files  []FileInfo `json:"files"`
+		Files  []fileInfo `json:"files"`
 	}{SHA256: shaHex}
 
 	for _, p := range paths {
@@ -146,11 +207,7 @@ func (c *Controller) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 		if len(prev) > 300 {
 			prev = prev[:300] + "...(truncated)"
 		}
-		out.Files = append(out.Files, FileInfo{
-			Path:    p,
-			Size:    len(body),
-			Preview: prev,
-		})
+		out.Files = append(out.Files, fileInfo{Path: p, Size: len(body), Preview: prev})
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -178,19 +235,22 @@ func (m *memStore) UpdateStatusDetail(id, st, sha, errMsg string, _ map[string]a
 }
 
 func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
-	// 0) global
 	merged := map[string]string{}
+
+	// 0) global
 	if b.gvars != nil {
 		for k, v := range b.gvars.GlobalVars() {
 			merged[k] = v
 		}
 	}
+
 	// 1) group
 	groupIDs, _ := b.repo.GetGroupIDs(uuid)
 	gvars, _ := b.repo.GetGroupVars(groupIDs)
 	for k, v := range gvars {
 		merged[k] = v
 	}
+
 	// 2) device
 	dvars, _ := b.repo.GetDeviceVars(uuid)
 	for k, v := range dvars {
@@ -255,20 +315,32 @@ func (b *Builder) BuildConfig(d DeviceFields) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Предопределённые переменные, которые ожидают многие шаблоны OpenWISP:
 	vars["id"] = d.UUID
 	vars["key"] = d.Key
 	vars["name"] = d.Name
 	if d.MAC != "" {
 		vars["mac_address"] = d.MAC
 	}
-
-	// подстраховка для hostname, если забыли задать явно
 	if v := strings.TrimSpace(vars["hostname"]); v == "" && d.Name != "" {
 		vars["hostname"] = d.Name
 	}
-	return b.tpl.RenderAll(d.UUID, vars)
+
+	tpls, err := b.collectTemplates(d.UUID)
+	if err != nil {
+		return nil, fmt.Errorf("collect templates: %w", err)
+	}
+
+	// отрисовываем по порядку, позже перекрывает ранее созданный файл по тому же path
+	files := map[string]string{}
+	for _, t := range tpls {
+		rendered, err := b.tpl.RenderOne(t, vars) // добавь метод; для Type="go" → Go-template; Type="netjson" → см. ниже
+		if err != nil {
+			return nil, fmt.Errorf("template %d (%s): %w", t.ID, t.Name, err)
+		}
+		// у шаблона один path; если «мультифайл» — верни map[path]body
+		files[t.Path] = rendered
+	}
+	return files, nil
 }
 
 func (b *Builder) RenderFiles(uuid string) (map[string]string, error) {
@@ -519,6 +591,11 @@ func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) 
 		}
 		key = in.Key
 		status = strings.ToLower(in.Status)
+		status = normalizeStatus(status)
+
+		if err := c.store.UpdateStatusDetail(id, status, configSHA, errLog, facts); err != nil {
+			_ = c.store.UpdateStatus(id, status)
+		}
 		configSHA = in.ConfigSHA
 		if in.Log != "" {
 			errLog = in.Log
@@ -655,4 +732,17 @@ func RegisterRoutesWithStoreAndBuilder(root *mux.Router, sharedSecret string, st
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
 	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
+}
+
+func normalizeStatus(s string) string {
+	switch s {
+	case "running", "applied", "ok", "success":
+		return "applied"
+	case "error", "failed", "rollbacked":
+		return "error"
+	case "deactivating":
+		return "deactivating"
+	default:
+		return "pending" // changed, modified, queued и пр.
+	}
 }

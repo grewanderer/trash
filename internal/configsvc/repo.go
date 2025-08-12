@@ -115,3 +115,52 @@ func (r *Repo) TemplatesByIDs(ids []uint) ([]models.Template, error) {
 	err := r.db.Where("id IN ?", ids).Find(&out).Error
 	return out, err
 }
+
+func (r *Repo) ListRequiredTemplates() ([]models.Template, error) {
+	var t []models.Template
+	err := r.db.Where("required = ?", true).Order("id ASC").Find(&t).Error
+	return t, err
+}
+
+// group templates
+func (r *Repo) ListGroupTemplates(groupIDs []uint) ([]models.GroupTemplateAssignment, error) {
+	if len(groupIDs) == 0 {
+		return nil, nil
+	}
+	var as []models.GroupTemplateAssignment
+	err := r.db.
+		Where("enabled = 1 AND group_id IN ?", groupIDs).
+		Order("`order` ASC, id ASC").
+		Find(&as).Error
+	return as, err
+}
+
+// device blocks
+func (r *Repo) ListDeviceTemplateBlocks(uuid string) (map[uint]struct{}, error) {
+	var rows []models.DeviceTemplateBlock
+	err := r.db.Where("device_uuid = ?", uuid).Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[uint]struct{}, len(rows))
+	for _, b := range rows {
+		m[b.TemplateID] = struct{}{}
+	}
+	return m, nil
+}
+
+// helpers
+func (r *Repo) GetTemplatesByIDs(ids []uint) (map[uint]models.Template, error) {
+	if len(ids) == 0 {
+		return map[uint]models.Template{}, nil
+	}
+	var ts []models.Template
+	if err := r.db.Where("id IN ?", ids).Find(&ts).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[uint]models.Template, len(ts))
+	for _, t := range ts {
+		out[t.ID] = t
+	}
+	return out, nil
+}
