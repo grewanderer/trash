@@ -32,6 +32,7 @@ func (h *HTTP) RegisterRoutes(r *mux.Router) {
 	// assignments
 	api.HandleFunc("/devices/{uuid}/templates/{id}", h.assignTemplate).Methods(http.MethodPost)
 	api.HandleFunc("/devices/{uuid}/templates", h.listAssignments).Methods(http.MethodGet)
+	api.HandleFunc("/devices/{uuid}/templates/order", h.reorderTemplates).Methods(http.MethodPut, http.MethodPost)
 }
 
 func (h *HTTP) createTemplate(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +161,29 @@ func (h *HTTP) bulkUpsertVars(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *HTTP) reorderTemplates(w http.ResponseWriter, r *http.Request) {
+	uuid := mux.Vars(r)["uuid"]
+	var in struct {
+		Items []struct {
+			ID    uint `json:"id"`
+			Order int  `json:"order"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	items := make([]ReorderItem, 0, len(in.Items))
+	for _, it := range in.Items {
+		items = append(items, ReorderItem{ID: it.ID, Order: it.Order})
+	}
+	if err := h.repo.ReorderDeviceTemplates(uuid, items); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

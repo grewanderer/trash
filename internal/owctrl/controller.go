@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +43,9 @@ type DeviceFields struct {
 	Backend   string
 	MAC       string
 	Status    string
+	LastSeen  time.Time
+	LastError string
+	LastSHA   string
 	UpdatedAt time.Time
 }
 
@@ -49,6 +54,7 @@ type Store interface {
 	UpsertByKey(key string, d DeviceFields) (DeviceFields, bool)
 	FindByUUID(id string) (DeviceFields, bool)
 	UpdateStatus(id, status string) error
+	UpdateStatusDetail(id, status, configSHA, errMsg string, facts map[string]any) error
 }
 
 // ConfigBuilder — контракт сборщика конфигурации устройства.
@@ -85,6 +91,26 @@ type Builder struct {
 	repo VarsProvider
 	ipam IPAMProvider
 	tpl  TemplateRenderer
+}
+
+func (m *memStore) UpdateStatusDetail(id, st, sha, errMsg string, _ map[string]any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.byUUID[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	d.Status = st
+	d.LastSeen = time.Now()
+	if sha != "" {
+		d.LastSHA = sha
+	}
+	if errMsg != "" {
+		d.LastError = errMsg
+	}
+	d.UpdatedAt = time.Now()
+	m.byUUID[id] = d
+	return nil
 }
 
 func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
@@ -153,6 +179,28 @@ func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
 	}
 
 	return merged, nil
+}
+
+// BuildConfig satisfies ConfigBuilder
+func (b *Builder) BuildConfig(d DeviceFields) (map[string]string, error) {
+	vars, err := b.mergeVars(d.UUID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Предопределённые переменные, которые ожидают многие шаблоны OpenWISP:
+	vars["id"] = d.UUID
+	vars["key"] = d.Key
+	vars["name"] = d.Name
+	if d.MAC != "" {
+		vars["mac_address"] = d.MAC
+	}
+
+	// подстраховка для hostname, если забыли задать явно
+	if v := strings.TrimSpace(vars["hostname"]); v == "" && d.Name != "" {
+		vars["hostname"] = d.Name
+	}
+	return b.tpl.RenderAll(d.UUID, vars)
 }
 
 func (b *Builder) RenderFiles(uuid string) (map[string]string, error) {
@@ -278,8 +326,9 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	mac := r.Form.Get("mac_address")
 	key := r.Form.Get("key")
 	if key == "" {
-		sum := sha256.Sum256([]byte(mac + "+" + secret))
-		key = hex.EncodeToString(sum[:8]) // короткий стабильный ключ
+		mac := r.Form.Get("mac_address")
+		sum := md5.Sum([]byte(mac + secret)) // OpenWISP совместимость
+		key = hex.EncodeToString(sum[:])     // 32 hex
 	}
 
 	dev, isNew := c.store.UpsertByKey(key, DeviceFields{
@@ -378,16 +427,50 @@ func (c *Controller) handleDownloadConfig(w http.ResponseWriter, r *http.Request
 func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 	c.setOWHeader(w)
 	id := mux.Vars(r)["uuid"]
-	if err := r.ParseForm(); err != nil {
-		models.WriteProblem(w, http.StatusBadRequest, "Bad form", "cannot parse form", nil)
-		return
+
+	ct := r.Header.Get("Content-Type")
+	var key, status, configSHA, errLog string
+	facts := map[string]any{}
+
+	if strings.HasPrefix(ct, "application/json") {
+		var in struct {
+			Key       string         `json:"key"`
+			Status    string         `json:"status"`
+			ConfigSHA string         `json:"config_sha"`
+			Error     string         `json:"error"`
+			Log       string         `json:"log"`
+			Facts     map[string]any `json:"facts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			models.WriteProblem(w, http.StatusBadRequest, "Bad JSON", err.Error(), nil)
+			return
+		}
+		key = in.Key
+		status = strings.ToLower(in.Status)
+		configSHA = in.ConfigSHA
+		if in.Log != "" {
+			errLog = in.Log
+		} else {
+			errLog = in.Error
+		}
+		if in.Facts != nil {
+			facts = in.Facts
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			models.WriteProblem(w, http.StatusBadRequest, "Bad form", "cannot parse form", nil)
+			return
+		}
+		key = r.Form.Get("key")
+		status = strings.ToLower(r.Form.Get("status"))
+		configSHA = r.Form.Get("config_sha")
+		if v := r.Form.Get("log"); v != "" {
+			errLog = v
+		} else {
+			errLog = r.Form.Get("error")
+		}
 	}
-	key := r.Form.Get("key")
-	status := strings.ToLower(r.Form.Get("status"))
-	if status != "running" && status != "error" {
-		models.WriteProblem(w, http.StatusBadRequest, "Bad status", "status must be running|error", nil)
-		return
-	}
+
 	dev, ok := c.store.FindByUUID(id)
 	if !ok {
 		models.WriteProblem(w, http.StatusNotFound, "Not found", "device not found", map[string]string{"uuid": id})
@@ -397,7 +480,16 @@ func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) 
 		models.WriteProblem(w, http.StatusForbidden, "Forbidden", "invalid key", nil)
 		return
 	}
-	_ = c.store.UpdateStatus(id, status)
+	if status != "running" && status != "error" {
+		models.WriteProblem(w, http.StatusBadRequest, "Bad status", "status must be running|error", nil)
+		return
+	}
+
+	// сохраняем расширенно; если не реализовано — fallback на UpdateStatus
+	if err := c.store.UpdateStatusDetail(id, status, configSHA, errLog, facts); err != nil {
+		_ = c.store.UpdateStatus(id, status)
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok\n")

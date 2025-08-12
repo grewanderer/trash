@@ -3,6 +3,7 @@ package repo
 import (
 	"errors"
 	"strings"
+	"time"
 	"wisp/internal/models"
 	"wisp/internal/owctrl"
 
@@ -75,6 +76,26 @@ func (s *DeviceStore) UpsertByKey(key string, d owctrl.DeviceFields) (owctrl.Dev
 		Status:    m.Status,
 		UpdatedAt: m.UpdatedAt,
 	}, isNew
+}
+
+func (s *DeviceStore) UpdateStatusDetail(uuid, st, sha, errMsg string, facts map[string]any) error {
+	now := time.Now()
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.Device{}).
+			Where("uuid = ?", uuid).
+			Updates(map[string]any{
+				"status": st, "last_seen": now,
+				"last_config_sha": sha, "last_error": errMsg,
+			}).Error; err != nil {
+			return err
+		}
+		h := models.DeviceStatusHistory{DeviceUUID: uuid, Status: st, ConfigSHA: sha, Error: errMsg}
+		if err := tx.Create(&h).Error; err != nil {
+			return err
+		}
+		// facts можно сохранить в отдельную json-таблицу при необходимости
+		return nil
+	})
 }
 
 func (s *DeviceStore) FindByUUID(id string) (owctrl.DeviceFields, bool) {

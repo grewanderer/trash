@@ -18,9 +18,10 @@ type DeviceVariable struct {
 
 type DeviceTemplateAssignment struct {
 	gorm.Model
-	DeviceUUID string `gorm:"index"`
+	DeviceUUID string `gorm:"index;size:36"`
 	TemplateID uint   `gorm:"index"`
-	Enabled    bool
+	Enabled    bool   `gorm:"default:true"`
+	Order      int    `gorm:"default:100;index:idx_assign_order"`
 }
 
 type Group struct {

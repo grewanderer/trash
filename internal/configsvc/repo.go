@@ -61,6 +61,38 @@ func (r *Repo) GetDeviceVars(uuid string) (map[string]string, error) {
 
 // ── Assignments ────────────────────────────────────────────
 
+// Отдаём назначения по устройству, отсортированные по order ASC, id ASC
+func (r *Repo) ListAssignments(uuid string) ([]models.DeviceTemplateAssignment, error) {
+	var as []models.DeviceTemplateAssignment
+	err := r.db.
+		Where("device_uuid = ? AND enabled = ?", uuid, true).
+		Order("`order` ASC, id ASC").
+		Find(&as).Error
+	return as, err
+}
+
+type ReorderItem struct {
+	ID    uint
+	Order int
+}
+
+// Массовое изменение порядка шаблонов
+func (r *Repo) ReorderDeviceTemplates(uuid string, items []ReorderItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for _, it := range items {
+			if err := tx.Model(&models.DeviceTemplateAssignment{}).
+				Where("device_uuid = ? AND template_id = ?", uuid, it.ID).
+				Update("order", it.Order).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (r *Repo) AssignTemplate(uuid string, templateID uint, enabled bool) error {
 	var a models.DeviceTemplateAssignment
 	tx := r.db.Where("device_uuid = ? AND template_id = ?", uuid, templateID).First(&a)
@@ -73,12 +105,6 @@ func (r *Repo) AssignTemplate(uuid string, templateID uint, enabled bool) error 
 	}
 	a.Enabled = enabled
 	return r.db.Save(&a).Error
-}
-
-func (r *Repo) ListAssignments(uuid string) ([]models.DeviceTemplateAssignment, error) {
-	var out []models.DeviceTemplateAssignment
-	err := r.db.Where("device_uuid = ? AND enabled = TRUE", uuid).Order("id").Find(&out).Error
-	return out, err
 }
 
 func (r *Repo) TemplatesByIDs(ids []uint) ([]models.Template, error) {
