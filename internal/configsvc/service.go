@@ -13,12 +13,26 @@ import (
 
 type Builder struct {
 	repo *Repo
-	ipam *ipam.Repo // опционально
+	ipam *ipam.Repo       // опционально
+	tpl  TemplateRenderer // опционально, если не задан — будет создан дефолтный рендерер
 }
 
 func NewBuilder(repo *Repo) *Builder { return &Builder{repo: repo} }
 func NewBuilderWithIPAM(repo *Repo, ipam *ipam.Repo) *Builder {
-	return &Builder{repo: repo, ipam: ipam}
+	// совместимость: если рендерер явно не передали — создадим дефолтный
+	return &Builder{
+		repo: repo,
+		ipam: ipam,
+		tpl:  NewTemplateRenderer(repo),
+	}
+}
+
+// Явный конструктор, если хочешь подменять рендерер
+func NewBuilderWithIPAMAndRenderer(repo *Repo, ipam *ipam.Repo, tpl TemplateRenderer) *Builder {
+	if tpl == nil {
+		tpl = NewTemplateRenderer(repo)
+	}
+	return &Builder{repo: repo, ipam: ipam, tpl: tpl}
 }
 
 func (b *Builder) BuildConfig(d owctrl.DeviceFields) (map[string]string, error) {

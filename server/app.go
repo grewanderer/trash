@@ -89,6 +89,10 @@ func (a *App) Initialize(cfg *config.Config) {
 		); err != nil {
 			logs.Logger.Errorf("automigrate: %v", err)
 		}
+
+		if err := db.MigrateTemplateUniqueIndex(a.db); err != nil {
+			logs.Logger.Errorf("templates unique index migration: %v", err)
+		}
 	}
 
 	// 3) Роутер + middleware
@@ -106,34 +110,22 @@ func (a *App) Initialize(cfg *config.Config) {
 		health.RegisterRoutes(a.Router) // только /healthz
 	}
 
-	// 5) Конфиг-сервис и IPAM HTTP + билдер
-	var cfgRepoInst *configsvc.Repo
-	var cfgBuilder *configsvc.Builder
-	if a.db != nil {
-		cfgRepoInst = configsvc.NewRepo(a.db)
-		ipamRepo := ipam.NewRepo(a.db)
+	cfgRepoInst := configsvc.NewRepo(a.db)
+	ipamRepo := ipam.NewRepo(a.db)
 
-		// === ВАЖНО: регистрируем HTTP-ручки configsvc ===
-		cfgHTTP := configsvc.NewHTTP(cfgRepoInst)
-		cfgHTTP.RegisterRoutes(a.Router)
+	// HTTP ручки (как было)
+	configsvc.NewHTTP(cfgRepoInst).RegisterRoutes(a.Router)
+	configsvc.NewGroupHTTP(cfgRepoInst).RegisterRoutes(a.Router)
+	ipam.NewHTTP(ipamRepo).RegisterRoutes(a.Router)
+	ipam.NewDeviceHTTP(ipamRepo).RegisterRoutes(a.Router)
 
-		grpHTTP := configsvc.NewGroupHTTP(cfgRepoInst)
-		grpHTTP.RegisterRoutes(a.Router)
+	// Рендерер + билдер
+	tplRenderer := configsvc.NewTemplateRenderer(cfgRepoInst)
+	cfgBuilder := configsvc.NewBuilderWithIPAMAndRenderer(cfgRepoInst, ipamRepo, tplRenderer)
 
-		ipamHTTP := ipam.NewHTTP(ipamRepo) // для префиксов и назначения группе
-		ipamHTTP.RegisterRoutes(a.Router)
-		ipamDevHTTP := ipam.NewDeviceHTTP(ipamRepo) // для IP устройства
-		ipamDevHTTP.RegisterRoutes(a.Router)
-
-		cfgBuilder = configsvc.NewBuilderWithIPAM(cfgRepoInst, ipamRepo)
-	}
-	// 6) Контроллер (agent-совместимость)
-	if a.db != nil {
-		ds := repo.NewDeviceStore(a.db)
-		owctrl.RegisterRoutesWithStoreAndBuilder(a.Router, a.cfg.OpenWISP.SharedSecret, ds, cfgBuilder)
-	} else {
-		owctrl.RegisterRoutes(a.Router, a.cfg.OpenWISP.SharedSecret)
-	}
+	// Контроллер
+	ds := repo.NewDeviceStore(a.db)
+	owctrl.RegisterRoutesWithStoreAndBuilder(a.Router, a.cfg.OpenWISP.SharedSecret, ds, cfgBuilder)
 
 	a.Router.Walk(func(rt *mux.Route, r *mux.Router, ancestors []*mux.Route) error {
 		path, _ := rt.GetPathTemplate()

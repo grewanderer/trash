@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -310,35 +309,41 @@ func (b *Builder) mergeVars(uuid string) (map[string]string, error) {
 
 // BuildConfig satisfies ConfigBuilder
 func (b *Builder) BuildConfig(d DeviceFields) (map[string]string, error) {
+	// 1) собираем переменные (global → group → device → IPAM → validate)
 	vars, err := b.mergeVars(d.UUID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config build error: %w", err)
 	}
 
-	// предопределённые (в OpenWISP они всегда доступны)
+	// 2) предопределенные поля устройства — как в OpenWISP (в шаблонах должны быть доступны всегда)
 	vars["id"] = d.UUID
 	vars["key"] = d.Key
 	vars["name"] = d.Name
 	if d.MAC != "" {
 		vars["mac_address"] = d.MAC
 	}
-	if v := strings.TrimSpace(vars["hostname"]); v == "" && d.Name != "" {
+	if strings.TrimSpace(vars["hostname"]) == "" && d.Name != "" {
 		vars["hostname"] = d.Name
 	}
 
+	// 3) получаем итоговый список шаблонов по порядку (required → default → group → device)
 	tpls, err := b.collectTemplates(d.UUID)
 	if err != nil {
 		return nil, fmt.Errorf("collect templates: %w", err)
 	}
 
-	files := map[string]string{}
+	// 4) рендерим каждый шаблон и сливаем файлы (поздние перекрывают ранние по одному и тому же path)
+	files := make(map[string]string, 8)
 	for _, t := range tpls {
-		rendered, err := b.tpl.RenderOne(t, vars)
+		m, err := b.tpl.RenderOneFiles(t, vars)
 		if err != nil {
 			return nil, fmt.Errorf("template %d (%s): %w", t.ID, t.Name, err)
 		}
-		files[t.Path] = rendered // более поздний перекрывает ранний по одному path
+		for p, c := range m {
+			files[p] = c
+		}
 	}
+
 	return files, nil
 }
 
@@ -447,6 +452,11 @@ func (c *Controller) setOWHeader(w http.ResponseWriter) {
 	w.Header().Set("X-Openwisp-Controller", "true")
 }
 
+func (c *Controller) handleRoot(w http.ResponseWriter, r *http.Request) {
+	c.setOWHeader(w)                    // не мешает; дублирует заголовок
+	w.WriteHeader(http.StatusNoContent) // 204
+}
+
 // POST /controller/register/
 func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	c.setOWHeader(w)
@@ -463,23 +473,30 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	name := r.Form.Get("name")
 	backend := r.Form.Get("backend")
 	mac := r.Form.Get("mac_address")
-	key := r.Form.Get("key")
-	if key == "" {
-		mac := r.Form.Get("mac_address")
-		sum := md5.Sum([]byte(mac + secret)) // OpenWISP совместимость
-		key = hex.EncodeToString(sum[:])     // 32 hex
+	keyIn := r.Form.Get("key")
+
+	// если ключ не прислали — генерируем стабильный
+	if keyIn == "" {
+		sum := sha256.Sum256([]byte(mac + "+" + secret))
+		keyIn = hex.EncodeToString(sum[:8]) // короткий, как у нас и раньше
 	}
 
-	dev, isNew := c.store.UpsertByKey(key, DeviceFields{
+	// сохраняем/обновляем устройство по ключу
+	dev, isNew := c.store.UpsertByKey(keyIn, DeviceFields{
 		Name:    name,
 		Backend: backend,
 		MAC:     mac,
 	})
 
+	// ВАЖНО: возвращаем key из стора (dev.Key), не keyIn
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	_, _ = io.WriteString(w,
-		fmt.Sprintf("uuid: %s\nkey: %s\nhostname: %s\nis-new: %d\n",
-			dev.UUID, key, dev.Name, btoi(isNew)))
+		fmt.Sprintf(
+			"uuid: %s\nkey: %s\nhostname: %s\nis-new: %d\n",
+			dev.UUID, dev.Key, dev.Name, btoi(isNew),
+		),
+	)
 }
 
 func btoi(b bool) int {
@@ -571,10 +588,16 @@ func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) 
 	c.setOWHeader(w)
 	id := mux.Vars(r)["uuid"]
 
-	ct := r.Header.Get("Content-Type")
-	var key, status, configSHA, errLog string
-	facts := map[string]any{}
+	// Собираем входные поля в общие переменные
+	var (
+		key       string
+		status    string
+		configSHA string
+		errLog    string
+		facts     map[string]any
+	)
 
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
 	if strings.HasPrefix(ct, "application/json") {
 		var in struct {
 			Key       string         `json:"key"`
@@ -584,41 +607,38 @@ func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) 
 			Log       string         `json:"log"`
 			Facts     map[string]any `json:"facts"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&in); err != nil {
 			models.WriteProblem(w, http.StatusBadRequest, "Bad JSON", err.Error(), nil)
 			return
 		}
 		key = in.Key
-		status = strings.ToLower(in.Status)
-		status = normalizeStatus(status)
-
-		if err := c.store.UpdateStatusDetail(id, status, configSHA, errLog, facts); err != nil {
-			_ = c.store.UpdateStatus(id, status)
-		}
-		configSHA = in.ConfigSHA
-		if in.Log != "" {
+		status = normalizeStatus(strings.ToLower(strings.TrimSpace(in.Status)))
+		configSHA = strings.TrimSpace(in.ConfigSHA)
+		if strings.TrimSpace(in.Log) != "" {
 			errLog = in.Log
 		} else {
 			errLog = in.Error
 		}
-		if in.Facts != nil {
-			facts = in.Facts
-		}
+		facts = in.Facts
 	} else {
+		// form-urlencoded / multipart
 		if err := r.ParseForm(); err != nil {
 			models.WriteProblem(w, http.StatusBadRequest, "Bad form", "cannot parse form", nil)
 			return
 		}
 		key = r.Form.Get("key")
-		status = strings.ToLower(r.Form.Get("status"))
-		configSHA = r.Form.Get("config_sha")
-		if v := r.Form.Get("log"); v != "" {
+		status = normalizeStatus(strings.ToLower(strings.TrimSpace(r.Form.Get("status"))))
+		configSHA = strings.TrimSpace(r.Form.Get("config_sha"))
+		if v := strings.TrimSpace(r.Form.Get("log")); v != "" {
 			errLog = v
 		} else {
 			errLog = r.Form.Get("error")
 		}
+		// facts для формы опционально можно добавить позже (не критично)
 	}
 
+	// Валидация устройства и ключа
 	dev, ok := c.store.FindByUUID(id)
 	if !ok {
 		models.WriteProblem(w, http.StatusNotFound, "Not found", "device not found", map[string]string{"uuid": id})
@@ -628,12 +648,18 @@ func (c *Controller) handleReportStatus(w http.ResponseWriter, r *http.Request) 
 		models.WriteProblem(w, http.StatusForbidden, "Forbidden", "invalid key", nil)
 		return
 	}
-	if status != "running" && status != "error" {
-		models.WriteProblem(w, http.StatusBadRequest, "Bad status", "status must be running|error", nil)
+
+	// Жёсткая валидация статуса: допускаем только "running" и "error" на проводе агента,
+	// но normalizeStatus уже переводит "ok/success/applied" → "applied".
+	switch status {
+	case "running", "applied", "error", "pending", "deactivating":
+		// ок
+	default:
+		models.WriteProblem(w, http.StatusBadRequest, "Bad status", "status must be running|error (or ok/success/applied)", nil)
 		return
 	}
 
-	// сохраняем расширенно; если не реализовано — fallback на UpdateStatus
+	// Сохраняем расширенный статус; при отсутствии реализации — graceful fallback
 	if err := c.store.UpdateStatusDetail(id, status, configSHA, errLog, facts); err != nil {
 		_ = c.store.UpdateStatus(id, status)
 	}
@@ -661,41 +687,75 @@ func safe(s string) string {
 }
 
 // tarGzFromMap — собирает tar.gz из карты файлов.
-func tarGzFromMap(files map[string]string) ([]byte, error) {
-	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gw)
+func deterministicTarGz(files map[string]string) ([]byte, error) {
+	// 1) Отсортировать ключи (пути)
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
 
-	for name, content := range files {
-		h := &tar.Header{
+	// 2) Заполнить gzip с фикс. заголовком
+	var buf bytes.Buffer
+	gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	gw.Header.ModTime = time.Unix(0, 0) // ключ: иначе меняется при каждом вызове
+
+	tw := tar.NewWriter(gw)
+	epoch := time.Unix(0, 0)
+
+	// 3) Писать tar с фикс. полями
+	for _, name := range paths {
+		content := files[name]
+		hdr := &tar.Header{
 			Name:    name,
 			Mode:    0644,
 			Size:    int64(len(content)),
-			ModTime: time.Now(),
+			ModTime: epoch,
+			Uid:     0,
+			Gid:     0,
+			Uname:   "",
+			Gname:   "",
+			// Typeflag: tar.TypeReg, // можно указать явно, если хочешь
 		}
-		if err := tw.WriteHeader(h); err != nil {
+		if err := tw.WriteHeader(hdr); err != nil {
 			_ = tw.Close()
 			_ = gw.Close()
 			return nil, err
 		}
-		if _, err := io.Copy(tw, strings.NewReader(content)); err != nil {
+		if _, err := io.WriteString(tw, content); err != nil {
 			_ = tw.Close()
 			_ = gw.Close()
 			return nil, err
 		}
 	}
-	_ = tw.Close()
-	_ = gw.Close()
+	if err := tw.Close(); err != nil {
+		_ = gw.Close()
+		return nil, err
+	}
+	if err := gw.Close(); err != nil {
+		return nil, err
+	}
 	return buf.Bytes(), nil
 }
 
 func mustTarGz(files map[string]string) []byte {
-	b, err := tarGzFromMap(files)
+	b, err := deterministicTarGz(files)
 	if err != nil {
-		// в реальном коде лучше логировать/оборачивать, но для совместимости вернём пустой архив
 		return []byte{}
 	}
 	return b
+}
+
+func owHeaderMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// обе версии заголовка на всякий случай
+		w.Header().Set("X-Openwisp-Controller", "true")
+		w.Header().Set("X-OpenWisp-Controller", "true")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ─────────────────────────── route registrars ───────────────────────────
@@ -703,29 +763,53 @@ func mustTarGz(files map[string]string) []byte {
 // RegisterRoutes — fast dev: in-memory store.
 func RegisterRoutes(root *mux.Router, sharedSecret string) {
 	ctrl := NewController(sharedSecret)
+
+	// /controller и /controller/
+	root.HandleFunc("/controller", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
+
 	sub := root.PathPrefix("/controller").Subrouter()
+	sub.Use(owHeaderMW) // ← критично
+
+	sub.HandleFunc("/", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
+
 	sub.HandleFunc("/register/", ctrl.handleRegister).Methods(http.MethodPost)
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
-	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
+	sub.HandleFunc("/download-config/{uuid}//", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
 	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
+
+	// catch-all на другие GET/HEAD под /controller/* — тоже 204 с заголовком
+	sub.PathPrefix("/").Methods(http.MethodGet, http.MethodHead, http.MethodOptions).
+		HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 }
 
-// RegisterRoutesWithStore — с внешним хранилищем (БД).
 func RegisterRoutesWithStore(root *mux.Router, sharedSecret string, store Store) {
 	ctrl := NewControllerWithStore(sharedSecret, store)
+
+	root.HandleFunc("/controller", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
 	sub := root.PathPrefix("/controller").Subrouter()
+	sub.Use(owHeaderMW)
+
+	sub.HandleFunc("/", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
 	sub.HandleFunc("/register/", ctrl.handleRegister).Methods(http.MethodPost)
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
 	sub.HandleFunc("/report-status/{uuid}/", ctrl.handleReportStatus).Methods(http.MethodPost)
+
+	// опционально:
 	sub.HandleFunc("/debug-config/{uuid}/", ctrl.handleDebugConfig).Methods(http.MethodGet)
+	sub.PathPrefix("/").Methods(http.MethodGet, http.MethodHead, http.MethodOptions).
+		HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 }
 
-// RegisterRoutesWithStoreAndBuilder — с внешним хранилищем и сборщиком конфигов.
 func RegisterRoutesWithStoreAndBuilder(root *mux.Router, sharedSecret string, store Store, builder ConfigBuilder) {
 	ctrl := NewControllerWithStoreAndBuilder(sharedSecret, store, builder)
+
+	root.HandleFunc("/controller", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead)
 	sub := root.PathPrefix("/controller").Subrouter()
+	sub.Use(owHeaderMW)
+	sub.HandleFunc("/", ctrl.handleRoot).Methods(http.MethodGet, http.MethodHead)
+
 	sub.HandleFunc("/register/", ctrl.handleRegister).Methods(http.MethodPost)
 	sub.HandleFunc("/checksum/{uuid}/", ctrl.handleChecksum).Methods(http.MethodGet)
 	sub.HandleFunc("/download-config/{uuid}/", ctrl.handleDownloadConfig).Methods(http.MethodGet)
@@ -737,7 +821,7 @@ func normalizeStatus(s string) string {
 	switch s {
 	case "running", "applied", "ok", "success":
 		return "applied"
-	case "error", "failed", "rollbacked":
+	case "error", "failed":
 		return "error"
 	case "deactivating":
 		return "deactivating"
